@@ -9,42 +9,43 @@ from scraper import scrape_site
 
 app = FastAPI(title="Website Scraper API")
 
+MAX_OUTPUT_BYTES = 7800
+MAX_TEXT_PER_PAGE = 300
+
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def health():
     return {"status": "ok"}
 
-MAX_OUTPUT_BYTES = 7800
-MAX_HEADINGS = 5
-MAX_TEXT = 150
-MAX_META = 120
-MAX_TITLE = 80
 
-
-def _truncate(s: str, maxlen: int) -> str:
-    if len(s) <= maxlen:
-        return s
-    return s[: maxlen - 3] + "..."
-
-
-def _compact_page(page: dict) -> dict:
+def _build_page_block(page: dict) -> str:
+    """Build a readable text block for one page."""
     path = urlparse(page["url"]).path or "/"
-    return {
-        "p": path,
-        "cat": page["category"],
-        "t": _truncate(page["title"], MAX_TITLE),
-        "d": _truncate(page["meta_description"], MAX_META),
-        "h1": _truncate(page["h1"], MAX_TITLE),
-        "h": [_truncate(h, 60) for h in page["headings"][:MAX_HEADINGS]],
-        "txt": _truncate(page["text_preview"], MAX_TEXT),
-        "img": page["images_count"],
-        "lnk": page["links_count"],
-    }
+    cat = page["category"]
+    lines = [f"## [{cat.upper()}] {page['title']}"]
+    lines.append(f"Path: {path}")
+
+    if page["meta_description"]:
+        lines.append(f"Description: {page['meta_description']}")
+
+    if page["h1"]:
+        lines.append(f"H1: {page['h1']}")
+
+    headings = [h for h in page["headings"][:6] if h]
+    if headings:
+        lines.append("Sections: " + " | ".join(headings))
+
+    if page["text_preview"]:
+        text = page["text_preview"][:MAX_TEXT_PER_PAGE]
+        if len(page["text_preview"]) > MAX_TEXT_PER_PAGE:
+            text += "..."
+        lines.append(f"Content: {text}")
+
+    return "\n".join(lines)
 
 
 @app.post("/scrape")
 async def scrape(request: Request):
-    # Handle both proper JSON and double-serialized string from Clay
     body = await request.body()
     try:
         data = json.loads(body)
@@ -57,70 +58,72 @@ async def scrape(request: Request):
     if not url:
         raise HTTPException(status_code=400, detail="Missing 'url' field")
 
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     full_url = url if url.startswith("http") else f"https://{url}"
+    domain = urlparse(full_url).netloc
 
-    # Always return 200 so Clay gets a valid response
+    # Always return 200
     try:
         raw = scrape_site(url)
     except Exception as exc:
         return {
-            "url": full_url,
-            "domain": urlparse(full_url).netloc,
-            "ts": ts,
-            "n": 0,
+            "domain": domain,
             "error": str(exc),
-            "pages": [],
-            "summary": {"cats": [], "pricing": False, "blog": False},
+            "content": f"# {domain}\n\nError: could not scrape this website.",
         }
 
-    # Categorize each page
+    # Categorize
     for page in raw["pages"]:
         page["category"] = categorize_page(page["url"], page)
 
-    # Deduplicate: keep one page per category, allow multiple "other"
-    seen_cats: dict[str, dict] = {}
+    # Deduplicate: one page per category, allow multiple "other"
+    seen_cats: set[str] = set()
     unique_pages: list[dict] = []
     for p in raw["pages"]:
         cat = p["category"]
         if cat not in seen_cats:
-            seen_cats[cat] = p
+            seen_cats.add(cat)
             unique_pages.append(p)
         elif cat == "other":
             unique_pages.append(p)
 
-    categories_found = sorted({p["category"] for p in unique_pages})
-    compact_pages = [_compact_page(p) for p in unique_pages]
+    categories = sorted({p["category"] for p in unique_pages})
 
-    result = {
-        "url": full_url,
-        "domain": raw["domain"],
-        "ts": ts,
-        "n": len(compact_pages),
-        "pages": compact_pages,
-        "summary": {
-            "cats": categories_found,
-            "pricing": "pricing" in categories_found,
-            "blog": "blog" in categories_found,
-        },
+    # Build single text output
+    header = f"# {domain}"
+    header += f"\nCategories: {', '.join(categories)}"
+    header += f"\nPages found: {len(unique_pages)}"
+    header += f"\nHas pricing: {'yes' if 'pricing' in categories else 'no'}"
+    header += f"\nHas blog: {'yes' if 'blog' in categories else 'no'}"
+    header += "\n"
+
+    blocks = [header]
+    for p in unique_pages:
+        blocks.append(_build_page_block(p))
+
+    content = "\n\n".join(blocks)
+
+    # Trim from the end if over budget
+    if len(content.encode("utf-8")) > MAX_OUTPUT_BYTES:
+        while blocks and len("\n\n".join(blocks).encode("utf-8")) > MAX_OUTPUT_BYTES:
+            # Remove last "other" block first (index > 0 to keep header)
+            removed = False
+            for i in range(len(blocks) - 1, 0, -1):
+                if "[OTHER]" in blocks[i]:
+                    blocks.pop(i)
+                    removed = True
+                    break
+            if not removed and len(blocks) > 1:
+                blocks.pop()
+        content = "\n\n".join(blocks)
+
+    return {
+        "domain": domain,
+        "categories": categories,
+        "has_pricing": "pricing" in categories,
+        "has_blog": "blog" in categories,
+        "page_count": len(unique_pages),
+        "content": content,
     }
-
-    # Trim "other" pages if over budget
-    output = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
-    while len(output) > MAX_OUTPUT_BYTES and result["pages"]:
-        removed = False
-        for i in range(len(result["pages"]) - 1, -1, -1):
-            if result["pages"][i]["cat"] == "other":
-                result["pages"].pop(i)
-                result["n"] = len(result["pages"])
-                removed = True
-                break
-        if not removed:
-            result["pages"].pop()
-            result["n"] = len(result["pages"])
-        output = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
-
-    return result
 
 
 if __name__ == "__main__":
