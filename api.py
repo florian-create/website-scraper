@@ -10,7 +10,7 @@ from scraper import scrape_site
 app = FastAPI(title="Website Scraper API")
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def health():
     return {"status": "ok"}
 
@@ -57,12 +57,22 @@ async def scrape(request: Request):
     if not url:
         raise HTTPException(status_code=400, detail="Missing 'url' field")
 
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    full_url = url if url.startswith("http") else f"https://{url}"
+
+    # Always return 200 so Clay gets a valid response
     try:
         raw = scrape_site(url)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Scraping failed: {exc}") from exc
+        return {
+            "url": full_url,
+            "domain": urlparse(full_url).netloc,
+            "ts": ts,
+            "n": 0,
+            "error": str(exc),
+            "pages": [],
+            "summary": {"cats": [], "pricing": False, "blog": False},
+        }
 
     # Categorize each page
     for page in raw["pages"]:
@@ -83,9 +93,9 @@ async def scrape(request: Request):
     compact_pages = [_compact_page(p) for p in unique_pages]
 
     result = {
-        "url": url if url.startswith("http") else f"https://{url}",
+        "url": full_url,
         "domain": raw["domain"],
-        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "ts": ts,
         "n": len(compact_pages),
         "pages": compact_pages,
         "summary": {
