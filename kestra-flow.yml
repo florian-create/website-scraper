@@ -1,0 +1,236 @@
+id: website-scraper
+namespace: company.scraper
+
+description: |
+  Scrape un site web et retourne un JSON structuré avec les pages principales,
+  leur catégorie et un résumé. Appelable via webhook depuis Clay.
+
+inputs:
+  - id: url
+    type: STRING
+    description: "URL du site à scraper"
+
+tasks:
+  - id: scrape
+    type: io.kestra.plugin.scripts.python.Script
+    warningOnStdErr: false
+    beforeCommands:
+      - pip install requests beautifulsoup4 lxml
+    outputFiles:
+      - "result.json"
+    script: |
+      import json
+      import requests
+      from bs4 import BeautifulSoup
+      from urllib.parse import urljoin, urlparse
+      from datetime import datetime, timezone
+
+      MAX_OUTPUT_BYTES = 7800
+      MAX_PAGES = 15
+      MAX_HEADINGS = 5
+      MAX_TEXT = 150
+      MAX_META = 120
+      MAX_TITLE = 80
+
+      HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; WebsiteScraper/1.0)"}
+      TIMEOUT = 15
+
+      # --- Scraper ---
+      def same_domain(base_url, link):
+          return urlparse(link).netloc == urlparse(base_url).netloc
+
+      def extract_nav_links(soup, base_url):
+          seen = set()
+          links = []
+          containers = soup.select("nav, header, [role='navigation']")
+          if not containers:
+              containers = [soup]
+          for container in containers:
+              for a in container.find_all("a", href=True):
+                  href = urljoin(base_url, a["href"]).split("#")[0].rstrip("/")
+                  if not href or href in seen:
+                      continue
+                  if not href.startswith(("http://", "https://")):
+                      continue
+                  if not same_domain(base_url, href):
+                      continue
+                  seen.add(href)
+                  links.append(href)
+          return links
+
+      def scrape_page(url):
+          try:
+              resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+              resp.raise_for_status()
+          except requests.RequestException:
+              return None
+          soup = BeautifulSoup(resp.text, "lxml")
+          title = soup.title.string.strip() if soup.title and soup.title.string else ""
+          meta_tag = soup.find("meta", attrs={"name": "description"})
+          meta_description = meta_tag["content"].strip() if meta_tag and meta_tag.get("content") else ""
+          h1_tag = soup.find("h1")
+          h1 = h1_tag.get_text(strip=True) if h1_tag else ""
+          headings = [h.get_text(strip=True) for h in soup.find_all(["h2", "h3"]) if h.get_text(strip=True)]
+          main = soup.find("main") or soup.find("article") or soup.body
+          text_preview = main.get_text(separator=" ", strip=True) if main else ""
+          return {
+              "url": url,
+              "title": title,
+              "meta_description": meta_description,
+              "h1": h1,
+              "headings": headings,
+              "text_preview": text_preview,
+              "images_count": len(soup.find_all("img", src=True)),
+              "links_count": len(soup.find_all("a", href=True)),
+          }
+
+      # --- Categorizer ---
+      RULES = [
+          ("pricing", ["pricing", "plans", "tarif"]),
+          ("product", ["product", "features", "solution", "use-case"]),
+          ("about", ["about", "team", "a-propos", "qui-sommes"]),
+          ("contact", ["contact"]),
+          ("blog", ["blog", "articles", "news", "actualites"]),
+          ("legal", ["privacy", "terms", "legal", "cgu", "cgv", "mentions-legales"]),
+          ("careers", ["careers", "jobs", "recrutement"]),
+          ("faq", ["faq", "help", "support"]),
+          ("partners", ["partner", "partenaire"]),
+          ("case-study", ["case-stud", "temoignage", "success-stor"]),
+          ("press", ["press", "presse", "media"]),
+      ]
+
+      def categorize_page(url, content):
+          path = urlparse(url).path.lower().strip("/")
+          h1 = (content.get("h1") or "").lower()
+          title = (content.get("title") or "").lower()
+          if path in ("", "home", "index", "index.html"):
+              return "home"
+          # Skip localized homepages (e.g. /fr, /de, /en)
+          if len(path) <= 3 and path.isalpha():
+              return "home"
+          searchable = f"{path} {h1} {title}"
+          for category, keywords in RULES:
+              for kw in keywords:
+                  if kw in searchable:
+                      return category
+          return "other"
+
+      def truncate(s, maxlen):
+          if len(s) <= maxlen:
+              return s
+          return s[:maxlen-3] + "..."
+
+      def compact_page(page):
+          """Compact a page dict to minimize JSON size."""
+          # Use path instead of full URL to save bytes
+          path = urlparse(page["url"]).path or "/"
+          return {
+              "p": path,
+              "cat": page["category"],
+              "t": truncate(page["title"], MAX_TITLE),
+              "d": truncate(page["meta_description"], MAX_META),
+              "h1": truncate(page["h1"], MAX_TITLE),
+              "h": [truncate(h, 60) for h in page["headings"][:MAX_HEADINGS]],
+              "txt": truncate(page["text_preview"], MAX_TEXT),
+              "img": page["images_count"],
+              "lnk": page["links_count"],
+          }
+
+      # --- Main ---
+      url = "{{ inputs.url }}".strip()
+      if not url.startswith(("http://", "https://")):
+          url = "https://" + url
+
+      try:
+          parsed = urlparse(url)
+          base_url = f"{parsed.scheme}://{parsed.netloc}"
+          domain = parsed.netloc
+
+          resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+          resp.raise_for_status()
+          soup = BeautifulSoup(resp.text, "lxml")
+
+          nav_links = extract_nav_links(soup, base_url)
+          homepage = base_url.rstrip("/")
+          if homepage not in nav_links:
+              nav_links.insert(0, homepage)
+
+          pages = []
+          scraped_urls = set()
+          for link in nav_links:
+              normalized = link.rstrip("/")
+              if normalized in scraped_urls:
+                  continue
+              scraped_urls.add(normalized)
+              page = scrape_page(link)
+              if page:
+                  page["category"] = categorize_page(page["url"], page)
+                  pages.append(page)
+              if len(pages) >= MAX_PAGES:
+                  break
+
+          # Deduplicate: keep one page per category, prefer shorter paths
+          seen_cats = {}
+          unique_pages = []
+          for p in pages:
+              cat = p["category"]
+              if cat not in seen_cats:
+                  seen_cats[cat] = p
+                  unique_pages.append(p)
+              elif cat == "other":
+                  unique_pages.append(p)
+
+          categories_found = sorted({p["category"] for p in unique_pages})
+          compact_pages = [compact_page(p) for p in unique_pages]
+
+          result = {
+              "url": url,
+              "domain": domain,
+              "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "n": len(compact_pages),
+              "pages": compact_pages,
+              "summary": {
+                  "cats": categories_found,
+                  "pricing": "pricing" in categories_found,
+                  "blog": "blog" in categories_found,
+              },
+          }
+
+          # Final size check: progressively trim if over budget
+          output = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+          while len(output) > MAX_OUTPUT_BYTES and result["pages"]:
+              # Remove last "other" page first, else last page
+              removed = False
+              for i in range(len(result["pages"]) - 1, -1, -1):
+                  if result["pages"][i]["cat"] == "other":
+                      result["pages"].pop(i)
+                      result["n"] = len(result["pages"])
+                      removed = True
+                      break
+              if not removed:
+                  result["pages"].pop()
+                  result["n"] = len(result["pages"])
+              output = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
+      except Exception as e:
+          result = {
+              "url": url,
+              "error": str(e),
+              "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "n": 0,
+              "pages": [],
+              "summary": {"cats": [], "pricing": False, "blog": False},
+          }
+
+      with open("result.json", "w") as f:
+          json.dump(result, f, ensure_ascii=False, separators=(",", ":"))
+
+  - id: output
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      result: "{{ read(outputs.scrape.outputFiles['result.json']) }}"
+
+triggers:
+  - id: webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: "scraper-webhook-key"
