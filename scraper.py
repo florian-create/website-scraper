@@ -53,7 +53,7 @@ def _scrape_page(url: str) -> dict | None:
     except requests.RequestException:
         return None
 
-    soup = BeautifulSoup(resp.text, "lxml")
+    soup = BeautifulSoup(resp.text, "html.parser")
 
     title = soup.title.string.strip() if soup.title and soup.title.string else ""
 
@@ -109,7 +109,7 @@ def scrape_site(url: str) -> dict:
     except requests.RequestException as exc:
         raise RuntimeError(f"Cannot reach {url}: {exc}") from exc
 
-    soup = BeautifulSoup(resp.text, "lxml")
+    soup = BeautifulSoup(resp.text, "html.parser")
 
     # 2. Discover nav links
     nav_links = _extract_nav_links(soup, base_url)

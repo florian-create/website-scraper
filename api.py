@@ -2,13 +2,17 @@ import json
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request
 
 from categorizer import categorize_page
 from scraper import scrape_site
 
 app = FastAPI(title="Website Scraper API")
+
+
+@app.get("/")
+def health():
+    return {"status": "ok"}
 
 MAX_OUTPUT_BYTES = 7800
 MAX_HEADINGS = 5
@@ -38,13 +42,20 @@ def _compact_page(page: dict) -> dict:
     }
 
 
-class ScrapeRequest(BaseModel):
-    url: str
-
-
 @app.post("/scrape")
-def scrape(req: ScrapeRequest):
-    url = req.url.strip()
+async def scrape(request: Request):
+    # Handle both proper JSON and double-serialized string from Clay
+    body = await request.body()
+    try:
+        data = json.loads(body)
+        if isinstance(data, str):
+            data = json.loads(data)
+    except (json.JSONDecodeError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    url = data.get("url", "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing 'url' field")
 
     try:
         raw = scrape_site(url)
