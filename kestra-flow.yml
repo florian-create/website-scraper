@@ -2,8 +2,8 @@ id: website-scraper
 namespace: company.scraper
 
 description: |
-  Scrape un site web et retourne un JSON structuré avec les pages principales,
-  leur catégorie et un résumé. Appelable via webhook depuis Clay.
+  Scrape un site web et retourne un brief d'intelligence compact et dédupliqué,
+  optimisé pour consommation IA. Appelable via webhook depuis Clay.
 
 inputs:
   - id: url
@@ -20,20 +20,70 @@ tasks:
       - "result.json"
     script: |
       import json
+      import re
       import requests
       from bs4 import BeautifulSoup
       from urllib.parse import urljoin, urlparse
-      from datetime import datetime, timezone
 
       MAX_OUTPUT_BYTES = 7800
       MAX_PAGES = 15
-      MAX_HEADINGS = 5
-      MAX_TEXT = 150
-      MAX_META = 120
-      MAX_TITLE = 80
-
       HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; WebsiteScraper/1.0)"}
       TIMEOUT = 15
+
+      # --- Text cleaning ---
+      _INVISIBLE_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]")
+      _WHITESPACE_RE = re.compile(r"[ \t\u00a0]+")
+      _BOILERPLATE_PHRASES = [
+          "get started", "learn more", "read more", "sign up", "start free trial",
+          "book a demo", "request a demo", "schedule a demo", "try for free",
+          "contact sales", "talk to sales", "watch demo", "see it in action",
+          "start now", "join now", "subscribe now", "download now",
+          "accept all cookies", "cookie policy", "we use cookies",
+          "accept cookies", "manage cookies", "cookie settings",
+      ]
+
+      def clean_text(text):
+          text = _INVISIBLE_RE.sub("", text)
+          text = _WHITESPACE_RE.sub(" ", text)
+          text = re.sub(r"\n[ \t]*\n+", "\n", text)
+          return text.strip()
+
+      def remove_boilerplate(text):
+          lines = text.split("\n")
+          cleaned = []
+          for line in lines:
+              lower = line.lower().strip()
+              if any(bp in lower for bp in _BOILERPLATE_PHRASES) and len(lower) < 80:
+                  continue
+              cleaned.append(line)
+          return "\n".join(cleaned)
+
+      def extract_structured_data(soup):
+          structured = {}
+          for script in soup.find_all("script", type="application/ld+json"):
+              try:
+                  data = json.loads(script.string or "")
+                  if isinstance(data, list):
+                      data = data[0] if data else {}
+                  if isinstance(data, dict):
+                      if data.get("description"):
+                          structured["schema_description"] = clean_text(data["description"])
+                      if data.get("name"):
+                          structured["schema_name"] = clean_text(data["name"])
+                      if data.get("@type"):
+                          structured["schema_type"] = data["@type"]
+              except (json.JSONDecodeError, TypeError, IndexError):
+                  continue
+          og_desc = soup.find("meta", property="og:description")
+          if og_desc and og_desc.get("content"):
+              structured["og_description"] = clean_text(og_desc["content"])
+          og_title = soup.find("meta", property="og:title")
+          if og_title and og_title.get("content"):
+              structured["og_title"] = clean_text(og_title["content"])
+          og_site = soup.find("meta", property="og:site_name")
+          if og_site and og_site.get("content"):
+              structured["og_site_name"] = clean_text(og_site["content"])
+          return structured
 
       # --- Scraper ---
       def same_domain(base_url, link):
@@ -65,76 +115,253 @@ tasks:
           except requests.RequestException:
               return None
           soup = BeautifulSoup(resp.text, "html.parser")
+          structured_data = extract_structured_data(soup)
           title = soup.title.string.strip() if soup.title and soup.title.string else ""
           meta_tag = soup.find("meta", attrs={"name": "description"})
-          meta_description = meta_tag["content"].strip() if meta_tag and meta_tag.get("content") else ""
+          meta_description = clean_text(meta_tag["content"].strip()) if meta_tag and meta_tag.get("content") else ""
           h1_tag = soup.find("h1")
-          h1 = h1_tag.get_text(strip=True) if h1_tag else ""
-          headings = [h.get_text(strip=True) for h in soup.find_all(["h2", "h3"]) if h.get_text(strip=True)]
+          h1 = clean_text(h1_tag.get_text(strip=True)) if h1_tag else ""
+          headings = [clean_text(h.get_text(strip=True)) for h in soup.find_all(["h2", "h3"]) if h.get_text(strip=True)]
+          for tag in soup.find_all(["script", "style", "nav", "footer", "aside"]):
+              tag.decompose()
           main = soup.find("main") or soup.find("article") or soup.body
-          text_preview = main.get_text(separator=" ", strip=True) if main else ""
+          text_preview = ""
+          if main:
+              raw_text = main.get_text(separator=" ", strip=True)
+              text_preview = remove_boilerplate(clean_text(raw_text))
           return {
               "url": url,
-              "title": title,
+              "title": clean_text(title),
               "meta_description": meta_description,
               "h1": h1,
               "headings": headings,
               "text_preview": text_preview,
-              "images_count": len(soup.find_all("img", src=True)),
-              "links_count": len(soup.find_all("a", href=True)),
+              "structured_data": structured_data,
           }
 
-      # --- Categorizer ---
-      RULES = [
-          ("pricing", ["pricing", "plans", "tarif"]),
-          ("product", ["product", "features", "solution", "use-case"]),
-          ("about", ["about", "team", "a-propos", "qui-sommes"]),
-          ("contact", ["contact"]),
-          ("blog", ["blog", "articles", "news", "actualites"]),
-          ("legal", ["privacy", "terms", "legal", "cgu", "cgv", "mentions-legales"]),
-          ("careers", ["careers", "jobs", "recrutement"]),
-          ("faq", ["faq", "help", "support"]),
-          ("partners", ["partner", "partenaire"]),
-          ("case-study", ["case-stud", "temoignage", "success-stor"]),
-          ("press", ["press", "presse", "media"]),
+      # --- Categorizer (14 categories, 3-pass) ---
+      URL_RULES = [
+          ("pricing", ["pricing", "plans", "tarif", "price", "cost", "subscription"]),
+          ("product", ["product", "features", "solution", "use-case", "platform", "capabilities"]),
+          ("about", ["about", "team", "a-propos", "qui-sommes", "our-story", "our-team", "leadership"]),
+          ("contact", ["contact", "contact-us", "contactez"]),
+          ("blog", ["blog", "articles", "news", "actualites", "insights", "resources"]),
+          ("legal", ["privacy", "terms", "legal", "cgu", "cgv", "mentions-legales", "cookie", "gdpr", "imprint", "disclaimer"]),
+          ("careers", ["careers", "jobs", "recrutement", "hiring", "open-positions", "join-us", "work-with-us"]),
+          ("faq", ["faq", "help", "support", "help-center", "knowledge-base"]),
+          ("partners", ["partner", "partenaire", "integrations", "marketplace", "ecosystem"]),
+          ("case-study", ["case-stud", "temoignage", "success-stor", "customer-stor", "clients", "testimonial"]),
+          ("press", ["press", "presse", "media", "newsroom", "in-the-news"]),
+          ("investors", ["investor", "ir", "shareholders", "annual-report", "governance"]),
+          ("security", ["security", "compliance", "trust", "certifications", "soc2", "iso27001"]),
+          ("api", ["api", "docs", "documentation", "developer", "reference", "changelog", "sdk"]),
       ]
+      CONTENT_RULES = [
+          ("pricing", ["pricing", "price", "cost", "subscription", "free trial", "per month", "per year", "plan"]),
+          ("product", ["product", "feature", "solution", "how it works", "capabilities", "platform"]),
+          ("about", ["about us", "our team", "our story", "who we are", "our mission", "founded"]),
+          ("contact", ["contact us", "get in touch", "reach out"]),
+          ("blog", ["blog", "article", "news", "latest post", "insights"]),
+          ("legal", ["privacy policy", "terms of service", "terms and conditions", "cookie policy", "legal notice"]),
+          ("careers", ["careers", "open positions", "join our team", "we're hiring", "job opening"]),
+          ("faq", ["frequently asked", "faq", "help center", "common questions"]),
+          ("partners", ["partners", "integrations", "marketplace", "ecosystem"]),
+          ("case-study", ["case study", "customer story", "success story", "testimonial"]),
+          ("press", ["press release", "in the news", "media coverage", "newsroom"]),
+          ("investors", ["investor relations", "shareholders", "annual report", "quarterly results"]),
+          ("security", ["security", "compliance", "trust center", "certifications", "data protection"]),
+          ("api", ["api reference", "documentation", "developer guide", "sdk", "api docs"]),
+      ]
+      PRODUCT_PREFIXES = ("why-", "how-it-works", "what-is-", "tour", "demo", "overview")
 
       def categorize_page(url, content):
           path = urlparse(url).path.lower().strip("/")
-          h1 = (content.get("h1") or "").lower()
-          title = (content.get("title") or "").lower()
+          segments = path.split("/")
           if path in ("", "home", "index", "index.html"):
               return "home"
-          # Skip localized homepages (e.g. /fr, /de, /en)
           if len(path) <= 3 and path.isalpha():
               return "home"
-          searchable = f"{path} {h1} {title}"
-          for category, keywords in RULES:
+          for category, keywords in URL_RULES:
+              for kw in keywords:
+                  if kw in path:
+                      return category
+          h1 = (content.get("h1") or "").lower()
+          title = (content.get("title") or "").lower()
+          meta = (content.get("meta_description") or "").lower()
+          headings_text = " ".join((content.get("headings") or [])).lower()
+          searchable = f"{title} {h1} {meta} {headings_text}"
+          for category, keywords in CONTENT_RULES:
               for kw in keywords:
                   if kw in searchable:
                       return category
+          for segment in segments:
+              if any(segment.startswith(prefix) for prefix in PRODUCT_PREFIXES):
+                  return "product"
           return "other"
 
-      def truncate(s, maxlen):
-          if len(s) <= maxlen:
-              return s
-          return s[:maxlen-3] + "..."
+      # --- Output builder ---
+      CATEGORY_PRIORITY = [
+          "home", "product", "pricing", "about", "api", "security",
+          "faq", "case-study", "partners", "investors", "careers",
+          "blog", "press", "contact", "legal", "other",
+      ]
 
-      def compact_page(page):
-          """Compact a page dict to minimize JSON size."""
-          # Use path instead of full URL to save bytes
-          path = urlparse(page["url"]).path or "/"
+      def priority(category):
+          try:
+              return CATEGORY_PRIORITY.index(category)
+          except ValueError:
+              return len(CATEGORY_PRIORITY)
+
+      def split_sentences(text):
+          sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+          return [s.strip() for s in sentences if s.strip()]
+
+      def sentence_overlap(a, b):
+          words_a = set(a.lower().split())
+          words_b = set(b.lower().split())
+          if not words_a or not words_b:
+              return 0.0
+          intersection = words_a & words_b
+          return len(intersection) / min(len(words_a), len(words_b))
+
+      def extract_best_summary(page):
+          sd = page.get("structured_data") or {}
+          best = (
+              page.get("meta_description")
+              or sd.get("og_description")
+              or sd.get("schema_description")
+              or page.get("h1")
+              or ""
+          ).strip()
+          if not best:
+              body_sentences = split_sentences(page.get("text_preview") or "")
+              return " ".join(body_sentences[:2])
+          body_sentences = split_sentences(page.get("text_preview") or "")
+          best_sentences = split_sentences(best)
+          unique_additions = []
+          for sentence in body_sentences:
+              if len(sentence) < 15:
+                  continue
+              is_redundant = any(
+                  sentence_overlap(sentence, existing) > 0.5
+                  for existing in best_sentences + unique_additions
+              )
+              if not is_redundant:
+                  unique_additions.append(sentence)
+              if len(unique_additions) >= 3:
+                  break
+          if unique_additions:
+              return best + " " + " ".join(unique_additions)
+          return best
+
+      def deduplicate_text(existing_sentences, new_text):
+          new_sentences = split_sentences(new_text)
+          unique = []
+          for sentence in new_sentences:
+              is_dup = any(
+                  sentence_overlap(sentence, seen) > 0.5
+                  for seen in existing_sentences
+              )
+              if not is_dup:
+                  unique.append(sentence)
+                  existing_sentences.append(sentence)
+          return " ".join(unique)
+
+      def extract_company_signals(pages):
+          categories = {p["category"] for p in pages}
+          tagline = ""
+          for p in pages:
+              if p["category"] == "home":
+                  sd = p.get("structured_data") or {}
+                  tagline = (
+                      p.get("h1")
+                      or sd.get("og_title")
+                      or p.get("meta_description")
+                      or ""
+                  ).strip()
+                  if len(tagline) > 120:
+                      sentences = split_sentences(tagline)
+                      tagline = sentences[0] if sentences else tagline[:120]
+                  break
+          products = []
+          for p in pages:
+              if p["category"] == "product":
+                  name = p.get("h1") or p.get("title") or ""
+                  name = name.strip()
+                  if name and name not in products and len(name) < 80:
+                      products.append(name)
+          site_name = ""
+          for p in pages:
+              sd = p.get("structured_data") or {}
+              if sd.get("og_site_name"):
+                  site_name = sd["og_site_name"]
+                  break
           return {
-              "p": path,
-              "cat": page["category"],
-              "t": truncate(page["title"], MAX_TITLE),
-              "d": truncate(page["meta_description"], MAX_META),
-              "h1": truncate(page["h1"], MAX_TITLE),
-              "h": [truncate(h, 60) for h in page["headings"][:MAX_HEADINGS]],
-              "txt": truncate(page["text_preview"], MAX_TEXT),
-              "img": page["images_count"],
-              "lnk": page["links_count"],
+              "tagline": tagline,
+              "products": products,
+              "site_name": site_name,
+              "has_pricing": "pricing" in categories,
+              "has_blog": "blog" in categories,
+              "has_careers": "careers" in categories,
           }
+
+      def build_page_line(page, existing_sentences, budget):
+          path = urlparse(page["url"]).path or "/"
+          cat = page["category"].upper()
+          summary = extract_best_summary(page)
+          summary = deduplicate_text(existing_sentences, summary)
+          headings = page.get("headings") or []
+          unique_headings = []
+          summary_lower = summary.lower()
+          for h in headings[:8]:
+              if h.lower() not in summary_lower and len(h) < 60:
+                  unique_headings.append(h)
+          heading_str = ""
+          if unique_headings:
+              heading_str = " [" + " | ".join(unique_headings[:4]) + "]"
+          line = f"{cat} {path}\n{summary}{heading_str}"
+          if len(line.encode("utf-8")) > budget:
+              while len(line.encode("utf-8")) > budget and line:
+                  line = line[:len(line) - 50].rstrip() + "..."
+          return line
+
+      def build_output(domain, pages):
+          signals = extract_company_signals(pages)
+          header_lines = [f"# {domain}"]
+          if signals["tagline"]:
+              header_lines.append(f"Tagline: {signals['tagline']}")
+          if signals["products"]:
+              header_lines.append(f"Products: {', '.join(signals['products'][:6])}")
+          flags = []
+          flags.append(f"Pages: {len(pages)}")
+          flags.append(f"Pricing: {'yes' if signals['has_pricing'] else 'no'}")
+          flags.append(f"Blog: {'yes' if signals['has_blog'] else 'no'}")
+          flags.append(f"Careers: {'yes' if signals['has_careers'] else 'no'}")
+          header_lines.append(" | ".join(flags))
+          header = "\n".join(header_lines)
+          pages_sorted = sorted(pages, key=lambda p: priority(p["category"]))
+          header_bytes = len(header.encode("utf-8")) + 20
+          remaining = MAX_OUTPUT_BYTES - header_bytes
+          page_count = len(pages_sorted)
+          if page_count == 0:
+              return header
+          base_budget = remaining // page_count
+          existing_sentences = []
+          page_blocks = []
+          for i, page in enumerate(pages_sorted):
+              if i < 3:
+                  budget = int(base_budget * 1.4)
+              elif i < 6:
+                  budget = base_budget
+              else:
+                  budget = int(base_budget * 0.7)
+              block = build_page_line(page, existing_sentences, budget)
+              page_blocks.append(block)
+          content = header + "\n\n## Key Content\n" + "\n\n".join(page_blocks)
+          while len(content.encode("utf-8")) > MAX_OUTPUT_BYTES and page_blocks:
+              page_blocks.pop()
+              content = header + "\n\n## Key Content\n" + "\n\n".join(page_blocks)
+          return content
 
       # --- Main ---
       url = "{{ inputs.url }}".strip()
@@ -169,61 +396,38 @@ tasks:
               if len(pages) >= MAX_PAGES:
                   break
 
-          # Deduplicate: keep one page per category, prefer shorter paths
-          seen_cats = {}
+          # Allow multiple product pages, deduplicate other categories
+          seen_cats = set()
           unique_pages = []
           for p in pages:
               cat = p["category"]
-              if cat not in seen_cats:
-                  seen_cats[cat] = p
+              if cat in ("product", "other"):
                   unique_pages.append(p)
-              elif cat == "other":
+              elif cat not in seen_cats:
+                  seen_cats.add(cat)
                   unique_pages.append(p)
 
           categories_found = sorted({p["category"] for p in unique_pages})
-          compact_pages = [compact_page(p) for p in unique_pages]
+          content = build_output(domain, unique_pages)
 
           result = {
-              "url": url,
               "domain": domain,
-              "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-              "n": len(compact_pages),
-              "pages": compact_pages,
-              "summary": {
-                  "cats": categories_found,
-                  "pricing": "pricing" in categories_found,
-                  "blog": "blog" in categories_found,
-              },
+              "categories": categories_found,
+              "has_pricing": "pricing" in categories_found,
+              "has_blog": "blog" in categories_found,
+              "page_count": len(unique_pages),
+              "content": content,
           }
-
-          # Final size check: progressively trim if over budget
-          output = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
-          while len(output) > MAX_OUTPUT_BYTES and result["pages"]:
-              # Remove last "other" page first, else last page
-              removed = False
-              for i in range(len(result["pages"]) - 1, -1, -1):
-                  if result["pages"][i]["cat"] == "other":
-                      result["pages"].pop(i)
-                      result["n"] = len(result["pages"])
-                      removed = True
-                      break
-              if not removed:
-                  result["pages"].pop()
-                  result["n"] = len(result["pages"])
-              output = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
 
       except Exception as e:
           result = {
-              "url": url,
+              "domain": domain if 'domain' in dir() else url,
               "error": str(e),
-              "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-              "n": 0,
-              "pages": [],
-              "summary": {"cats": [], "pricing": False, "blog": False},
+              "content": f"# {domain if 'domain' in dir() else url}\n\nError: could not scrape this website.",
           }
 
       with open("result.json", "w") as f:
-          json.dump(result, f, ensure_ascii=False, separators=(",", ":"))
+          json.dump(result, f, ensure_ascii=False)
 
   - id: output
     type: io.kestra.plugin.core.output.OutputValues
