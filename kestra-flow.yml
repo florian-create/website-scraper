@@ -3,7 +3,8 @@ namespace: company.scraper
 
 description: |
   Scrape un site web et retourne un brief d'intelligence compact et dédupliqué,
-  optimisé pour consommation IA. Appelable via webhook depuis Clay.
+  optimisé pour consommation IA. Fallback Scrapy si requests échoue.
+  Appelable via webhook depuis Clay.
 
 inputs:
   - id: url
@@ -15,23 +16,50 @@ tasks:
     type: io.kestra.plugin.scripts.python.Script
     warningOnStdErr: false
     beforeCommands:
-      - pip install requests beautifulsoup4
+      - pip install requests beautifulsoup4 scrapy
     outputFiles:
       - "result.json"
     script: |
       import json
+      import os
       import re
+      import subprocess
+      import sys
+      import tempfile
       import requests
+      from requests.adapters import HTTPAdapter
+      from urllib3.util.retry import Retry
       from bs4 import BeautifulSoup
       from urllib.parse import urljoin, urlparse
 
       MAX_OUTPUT_BYTES = 7800
       MAX_PAGES = 15
-      HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; WebsiteScraper/1.0)"}
       TIMEOUT = 15
 
+      # Browser-like headers
+      HEADERS = {
+          "User-Agent": (
+              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+          ),
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
+          "Accept-Encoding": "gzip, deflate, br",
+          "Cache-Control": "no-cache",
+          "Sec-Fetch-Dest": "document",
+          "Sec-Fetch-Mode": "navigate",
+          "Sec-Fetch-Site": "none",
+          "Sec-Fetch-User": "?1",
+          "Upgrade-Insecure-Requests": "1",
+      }
+      HEADERS_ALT = {
+          "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+      }
+
       # --- Text cleaning ---
-      _INVISIBLE_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]")
+      _INVISIBLE_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff\u200e\u200f\u00ad]")
       _WHITESPACE_RE = re.compile(r"[ \t\u00a0]+")
       _BOILERPLATE_PHRASES = [
           "get started", "learn more", "read more", "sign up", "start free trial",
@@ -40,12 +68,33 @@ tasks:
           "start now", "join now", "subscribe now", "download now",
           "accept all cookies", "cookie policy", "we use cookies",
           "accept cookies", "manage cookies", "cookie settings",
+          "skip to main content", "skip to footer", "skip to navigation",
+          "skip to content", "toggle navigation", "close menu", "open menu",
+          "register now", "sign in", "log in", "create account",
       ]
+      _INLINE_CTA_RE = re.compile(
+          r"\b(?:Get Started|Learn More|Read More|Sign Up|Book a Demo|Request a Demo|"
+          r"Register Now|Start Free Trial|Try for Free|Contact Sales|Talk to Sales|"
+          r"Watch Demo|See it in Action|Download Now|Subscribe Now|Start Now|"
+          r"Join Now|Skip to main content|Skip to footer|Skip to navigation|"
+          r"Skip to content)\b",
+          re.IGNORECASE,
+      )
+
+      def build_session():
+          session = requests.Session()
+          retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET", "HEAD"])
+          adapter = HTTPAdapter(max_retries=retry)
+          session.mount("http://", adapter)
+          session.mount("https://", adapter)
+          return session
 
       def clean_text(text):
-          text = _INVISIBLE_RE.sub("", text)
+          text = _INVISIBLE_RE.sub(" ", text)
           text = _WHITESPACE_RE.sub(" ", text)
           text = re.sub(r"\n[ \t]*\n+", "\n", text)
+          text = re.sub(r"\bundefined\b", "", text)
+          text = re.sub(r"\bnull\b(?!\s+(?:and|or|pointer|value|check|safety))", "", text)
           return text.strip()
 
       def remove_boilerplate(text):
@@ -53,10 +102,15 @@ tasks:
           cleaned = []
           for line in lines:
               lower = line.lower().strip()
-              if any(bp in lower for bp in _BOILERPLATE_PHRASES) and len(lower) < 80:
+              if not lower:
+                  continue
+              if any(bp == lower or (bp in lower and len(lower) < 80) for bp in _BOILERPLATE_PHRASES):
                   continue
               cleaned.append(line)
-          return "\n".join(cleaned)
+          text = "\n".join(cleaned)
+          text = _INLINE_CTA_RE.sub("", text)
+          text = _WHITESPACE_RE.sub(" ", text)
+          return text.strip()
 
       def extract_structured_data(soup):
           structured = {}
@@ -108,11 +162,22 @@ tasks:
                   links.append(href)
           return links
 
-      def scrape_page(url):
+      def fetch_page(session, url, headers):
           try:
-              resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+              resp = session.get(url, headers=headers, timeout=TIMEOUT, allow_redirects=True)
               resp.raise_for_status()
+              content_type = resp.headers.get("content-type", "")
+              if "text/html" not in content_type and "application/xhtml" not in content_type:
+                  return None
+              return resp
           except requests.RequestException:
+              return None
+
+      def scrape_page(session, url):
+          resp = fetch_page(session, url, HEADERS)
+          if resp is None:
+              resp = fetch_page(session, url, HEADERS_ALT)
+          if resp is None:
               return None
           soup = BeautifulSoup(resp.text, "html.parser")
           structured_data = extract_structured_data(soup)
@@ -122,8 +187,14 @@ tasks:
           h1_tag = soup.find("h1")
           h1 = clean_text(h1_tag.get_text(strip=True)) if h1_tag else ""
           headings = [clean_text(h.get_text(strip=True)) for h in soup.find_all(["h2", "h3"]) if h.get_text(strip=True)]
-          for tag in soup.find_all(["script", "style", "nav", "footer", "aside"]):
+          for tag in soup.find_all(["script", "style", "nav", "footer", "aside", "header", "noscript"]):
               tag.decompose()
+          for selector in ["[role='navigation']", "[role='banner']", "[role='contentinfo']",
+                           "[class*='cookie']", "[id*='cookie']", "[class*='banner']",
+                           "[class*='popup']", "[class*='modal']", "[class*='mega-menu']",
+                           "[class*='nav-']", "[class*='dropdown-menu']"]:
+              for tag in soup.select(selector):
+                  tag.decompose()
           main = soup.find("main") or soup.find("article") or soup.body
           text_preview = ""
           if main:
@@ -139,17 +210,125 @@ tasks:
               "structured_data": structured_data,
           }
 
+      # --- Scrapy fallback ---
+      def scrape_site_scrapy(target_url, domain):
+          """Fallback using Scrapy via inline subprocess."""
+          import scrapy
+          from scrapy.crawler import CrawlerProcess
+
+          fd, output_path = tempfile.mkstemp(suffix=".json")
+          os.close(fd)
+
+          spider_code = f'''
+      import json, re, scrapy
+      from bs4 import BeautifulSoup
+      from urllib.parse import urljoin, urlparse
+      from scrapy.crawler import CrawlerProcess
+
+      MAX_PAGES = 15
+      _INVISIBLE_RE = re.compile(r"[\\u200b\\u200c\\u200d\\u2060\\ufeff\\u200e\\u200f\\u00ad]")
+      _WHITESPACE_RE = re.compile(r"[ \\t\\u00a0]+")
+
+      def clean(text):
+          text = _INVISIBLE_RE.sub(" ", text)
+          text = _WHITESPACE_RE.sub(" ", text)
+          text = re.sub(r"\\n[ \\t]*\\n+", "\\n", text)
+          text = re.sub(r"\\bundefined\\b", "", text)
+          return text.strip()
+
+      def extract_sd(soup):
+          sd = {{}}
+          for s in soup.find_all("script", type="application/ld+json"):
+              try:
+                  d = json.loads(s.string or "")
+                  if isinstance(d, list): d = d[0] if d else {{}}
+                  if isinstance(d, dict):
+                      if d.get("description"): sd["schema_description"] = clean(d["description"])
+                      if d.get("name"): sd["schema_name"] = clean(d["name"])
+              except: pass
+          og = soup.find("meta", property="og:description")
+          if og and og.get("content"): sd["og_description"] = clean(og["content"])
+          og_t = soup.find("meta", property="og:title")
+          if og_t and og_t.get("content"): sd["og_title"] = clean(og_t["content"])
+          og_s = soup.find("meta", property="og:site_name")
+          if og_s and og_s.get("content"): sd["og_site_name"] = clean(og_s["content"])
+          return sd
+
+      def extract(html, url):
+          soup = BeautifulSoup(html, "html.parser")
+          sd = extract_sd(soup)
+          title = soup.title.string.strip() if soup.title and soup.title.string else ""
+          mt = soup.find("meta", attrs={{"name": "description"}})
+          md = clean(mt["content"]) if mt and mt.get("content") else ""
+          h1t = soup.find("h1")
+          h1 = clean(h1t.get_text(strip=True)) if h1t else ""
+          hs = [clean(h.get_text(strip=True)) for h in soup.find_all(["h2","h3"]) if h.get_text(strip=True)]
+          for t in soup.find_all(["script","style","nav","footer","aside","header","noscript"]): t.decompose()
+          m = soup.find("main") or soup.find("article") or soup.body
+          tp = clean(m.get_text(separator=" ", strip=True)) if m else ""
+          return {{"url":url,"title":clean(title),"meta_description":md,"h1":h1,"headings":hs,"text_preview":tp,"structured_data":sd}}
+
+      class S(scrapy.Spider):
+          name="s"
+          custom_settings={{"ROBOTSTXT_OBEY":False,"DOWNLOAD_TIMEOUT":20,"RETRY_TIMES":3,
+              "RETRY_HTTP_CODES":[500,502,503,504,408,429,403],"LOG_LEVEL":"ERROR",
+              "CONCURRENT_REQUESTS":4,"DOWNLOAD_DELAY":0.5,"COOKIES_ENABLED":True,
+              "USER_AGENT":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+              "DEFAULT_REQUEST_HEADERS":{{"Accept":"text/html,application/xhtml+xml","Accept-Language":"en-US,en;q=0.9"}}}}
+          def __init__(s,u=None,o=None,**kw):
+              super().__init__(**kw)
+              s.u=u; s.o=o; s.dom=urlparse(u).netloc; s.pages=[]; s.seen=set()
+          def start_requests(s):
+              yield scrapy.Request(s.u,callback=s.parse_home,errback=s.err,dont_filter=True)
+          def parse_home(s,r):
+              if r.status==200:
+                  p=extract(r.text,r.url)
+                  if p: s.pages.append(p); s.seen.add(r.url.rstrip("/"))
+                  links=set()
+                  for sel in ["nav a::attr(href)","header a::attr(href)","[role=navigation] a::attr(href)"]:
+                      for h in r.css(sel).getall():
+                          fu=urljoin(r.url,h).split("#")[0].rstrip("/")
+                          if urlparse(fu).netloc==s.dom: links.add(fu)
+                  if not links:
+                      for h in r.css("a::attr(href)").getall():
+                          fu=urljoin(r.url,h).split("#")[0].rstrip("/")
+                          if urlparse(fu).netloc==s.dom: links.add(fu)
+                  for l in links:
+                      if l.rstrip("/") not in s.seen and len(s.pages)<MAX_PAGES:
+                          s.seen.add(l.rstrip("/")); yield scrapy.Request(l,callback=s.parse_p,errback=s.err)
+          def parse_p(s,r):
+              if len(s.pages)<MAX_PAGES and r.status==200:
+                  p=extract(r.text,r.url)
+                  if p: s.pages.append(p)
+          def err(s,f): pass
+          def closed(s,reason):
+              with open(s.o,"w") as f: json.dump({{"domain":s.dom,"pages":s.pages}},f,ensure_ascii=False)
+
+      p=CrawlerProcess()
+      p.crawl(S,u="{target_url}",o="{output_path}")
+      p.start()
+      '''
+          try:
+              subprocess.run([sys.executable, "-c", spider_code], capture_output=True, timeout=90)
+              with open(output_path) as f:
+                  return json.load(f)
+          except:
+              return {"domain": domain, "pages": []}
+          finally:
+              try: os.unlink(output_path)
+              except: pass
+
       # --- Categorizer (14 categories, 3-pass) ---
       URL_RULES = [
           ("pricing", ["pricing", "plans", "tarif", "price", "cost", "subscription"]),
-          ("product", ["product", "features", "solution", "use-case", "platform", "capabilities"]),
-          ("about", ["about", "team", "a-propos", "qui-sommes", "our-story", "our-team", "leadership"]),
-          ("contact", ["contact", "contact-us", "contactez"]),
+          ("product", ["product", "features", "solution", "use-case", "platform", "capabilities", "compare", "trial", "services", "solutions"]),
+          ("about", ["about", "team", "a-propos", "qui-sommes", "quem-somos", "sobre", "uber-uns", "our-story", "our-team", "leadership", "empresa", "equipe"]),
+          ("contact", ["contact", "contact-us", "contactez", "contato", "kontakt", "fale-conosco"]),
           ("blog", ["blog", "articles", "news", "actualites", "insights", "resources"]),
           ("legal", ["privacy", "terms", "legal", "cgu", "cgv", "mentions-legales", "cookie", "gdpr", "imprint", "disclaimer"]),
           ("careers", ["careers", "jobs", "recrutement", "hiring", "open-positions", "join-us", "work-with-us"]),
           ("faq", ["faq", "help", "support", "help-center", "knowledge-base"]),
-          ("partners", ["partner", "partenaire", "integrations", "marketplace", "ecosystem"]),
+          ("partners", ["partner", "partenaire", "integrations", "marketplace", "ecosystem", "partnership"]),
           ("case-study", ["case-stud", "temoignage", "success-stor", "customer-stor", "clients", "testimonial"]),
           ("press", ["press", "presse", "media", "newsroom", "in-the-news"]),
           ("investors", ["investor", "ir", "shareholders", "annual-report", "governance"]),
@@ -159,7 +338,7 @@ tasks:
       CONTENT_RULES = [
           ("pricing", ["pricing", "price", "cost", "subscription", "free trial", "per month", "per year", "plan"]),
           ("product", ["product", "feature", "solution", "how it works", "capabilities", "platform"]),
-          ("about", ["about us", "our team", "our story", "who we are", "our mission", "founded"]),
+          ("about", ["about us", "our team", "our story", "who we are", "our mission", "founded", "quem somos", "nossa miss"]),
           ("contact", ["contact us", "get in touch", "reach out"]),
           ("blog", ["blog", "article", "news", "latest post", "insights"]),
           ("legal", ["privacy policy", "terms of service", "terms and conditions", "cookie policy", "legal notice"]),
@@ -179,7 +358,7 @@ tasks:
           segments = path.split("/")
           if path in ("", "home", "index", "index.html"):
               return "home"
-          if len(path) <= 3 and path.isalpha():
+          if len(path) <= 5 and all(c.isalpha() or c == "-" for c in path):
               return "home"
           for category, keywords in URL_RULES:
               for kw in keywords:
@@ -224,6 +403,18 @@ tasks:
           intersection = words_a & words_b
           return len(intersection) / min(len(words_a), len(words_b))
 
+      def clean_product_name(name):
+          name = re.sub(r"\s*[-\u2013\u2014|]\s*$", "", name)
+          name = re.sub(r"\s+", " ", name).strip()
+          if len(name) > 60:
+              for sep in [" - ", " | ", " \u2014 ", " \u2013 ", ": "]:
+                  if sep in name:
+                      name = name.split(sep)[0].strip()
+                      break
+              if len(name) > 60:
+                  name = name[:57] + "..."
+          return name
+
       def extract_best_summary(page):
           sd = page.get("structured_data") or {}
           best = (
@@ -233,6 +424,8 @@ tasks:
               or page.get("h1")
               or ""
           ).strip()
+          if not best and not page.get("text_preview"):
+              return ""
           if not best:
               body_sentences = split_sentences(page.get("text_preview") or "")
               return " ".join(body_sentences[:2])
@@ -286,9 +479,8 @@ tasks:
           products = []
           for p in pages:
               if p["category"] == "product":
-                  name = p.get("h1") or p.get("title") or ""
-                  name = name.strip()
-                  if name and name not in products and len(name) < 80:
+                  name = clean_product_name(p.get("h1") or p.get("title") or "")
+                  if name and name not in products:
                       products.append(name)
           site_name = ""
           for p in pages:
@@ -368,38 +560,63 @@ tasks:
       if not url.startswith(("http://", "https://")):
           url = "https://" + url
 
+      domain = urlparse(url).netloc or url
+
       try:
           parsed = urlparse(url)
           base_url = f"{parsed.scheme}://{parsed.netloc}"
           domain = parsed.netloc
 
-          resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-          resp.raise_for_status()
-          soup = BeautifulSoup(resp.text, "html.parser")
+          session = build_session()
 
-          nav_links = extract_nav_links(soup, base_url)
-          homepage = base_url.rstrip("/")
-          if homepage not in nav_links:
-              nav_links.insert(0, homepage)
+          # Strategy 1: requests with retry + alt headers
+          resp = fetch_page(session, url, HEADERS)
+          if resp is None:
+              resp = fetch_page(session, url, HEADERS_ALT)
 
           pages = []
-          scraped_urls = set()
-          for link in nav_links:
-              normalized = link.rstrip("/")
-              if normalized in scraped_urls:
-                  continue
-              scraped_urls.add(normalized)
-              page = scrape_page(link)
-              if page:
-                  page["category"] = categorize_page(page["url"], page)
-                  pages.append(page)
-              if len(pages) >= MAX_PAGES:
-                  break
+          if resp is not None:
+              soup = BeautifulSoup(resp.text, "html.parser")
+              nav_links = extract_nav_links(soup, base_url)
+              homepage = base_url.rstrip("/")
+              if homepage not in nav_links:
+                  nav_links.insert(0, homepage)
+
+              scraped_urls = set()
+              for link in nav_links:
+                  normalized = link.rstrip("/")
+                  if normalized in scraped_urls:
+                      continue
+                  scraped_urls.add(normalized)
+                  page = scrape_page(session, link)
+                  if page:
+                      pages.append(page)
+                  if len(pages) >= MAX_PAGES:
+                      break
+
+          # Strategy 2: Scrapy fallback if requests got nothing
+          if not pages:
+              scrapy_result = scrape_site_scrapy(url, domain)
+              pages = scrapy_result.get("pages", [])
+
+          if not pages:
+              raise RuntimeError(f"Cannot scrape {url}: all strategies failed")
+
+          # Filter out non-HTML pages
+          valid_pages = [
+              p for p in pages
+              if (p.get("title") or p.get("h1") or p.get("meta_description") or p.get("text_preview"))
+              and p.get("url", "").split(".")[-1].lower() not in ("pdf", "xlsx", "csv", "doc", "docx", "zip")
+          ]
+
+          # Categorize
+          for page in valid_pages:
+              page["category"] = categorize_page(page["url"], page)
 
           # Allow multiple product pages, deduplicate other categories
           seen_cats = set()
           unique_pages = []
-          for p in pages:
+          for p in valid_pages:
               cat = p["category"]
               if cat in ("product", "other"):
                   unique_pages.append(p)
@@ -421,9 +638,9 @@ tasks:
 
       except Exception as e:
           result = {
-              "domain": domain if 'domain' in dir() else url,
+              "domain": domain,
               "error": str(e),
-              "content": f"# {domain if 'domain' in dir() else url}\n\nError: could not scrape this website.",
+              "content": f"# {domain}\n\nError: could not scrape this website.",
           }
 
       with open("result.json", "w") as f:

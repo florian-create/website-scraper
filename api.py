@@ -42,6 +42,24 @@ def _sentence_overlap(a: str, b: str) -> float:
     return len(intersection) / min(len(words_a), len(words_b))
 
 
+def _clean_product_name(name: str) -> str:
+    """Clean a product name: strip marketing fluff, fix spacing."""
+    # Remove common suffixes/prefixes that aren't part of the name
+    name = re.sub(r"\s*[-–—|]\s*$", "", name)
+    # Collapse whitespace
+    name = re.sub(r"\s+", " ", name).strip()
+    # If still too long, take first meaningful phrase
+    if len(name) > 60:
+        # Try splitting on common separators
+        for sep in [" - ", " | ", " — ", " – ", ": "]:
+            if sep in name:
+                name = name.split(sep)[0].strip()
+                break
+        if len(name) > 60:
+            name = name[:57] + "..."
+    return name
+
+
 def _extract_best_summary(page: dict) -> str:
     """Pick the best description source, then add unique body sentences."""
     sd = page.get("structured_data") or {}
@@ -54,6 +72,10 @@ def _extract_best_summary(page: dict) -> str:
         or page.get("h1")
         or ""
     ).strip()
+
+    # Skip pages with no real content
+    if not best and not page.get("text_preview"):
+        return ""
 
     if not best:
         # Fallback: first 2 sentences of body text
@@ -117,13 +139,12 @@ def _extract_company_signals(pages: list[dict]) -> dict:
                 tagline = sentences[0] if sentences else tagline[:120]
             break
 
-    # Products: collect h1/titles from product pages
+    # Products: collect clean names from product pages
     products = []
     for p in pages:
         if p["category"] == "product":
-            name = p.get("h1") or p.get("title") or ""
-            name = name.strip()
-            if name and name not in products and len(name) < 80:
+            name = _clean_product_name(p.get("h1") or p.get("title") or "")
+            if name and name not in products:
                 products.append(name)
 
     # Site name from structured data
@@ -264,14 +285,21 @@ async def scrape(request: Request):
             "content": f"# {domain}\n\nError: could not scrape this website.",
         }
 
+    # Filter out pages with no usable content
+    valid_pages = [
+        p for p in raw["pages"]
+        if (p.get("title") or p.get("h1") or p.get("meta_description") or p.get("text_preview"))
+        and p.get("url", "").split(".")[-1].lower() not in ("pdf", "xlsx", "csv", "doc", "docx", "zip")
+    ]
+
     # Categorize
-    for page in raw["pages"]:
+    for page in valid_pages:
         page["category"] = categorize_page(page["url"], page)
 
     # Allow multiple product pages, deduplicate other categories
     seen_cats: set[str] = set()
     unique_pages: list[dict] = []
-    for p in raw["pages"]:
+    for p in valid_pages:
         cat = p["category"]
         if cat in ("product", "other"):
             unique_pages.append(p)

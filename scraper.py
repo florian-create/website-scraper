@@ -1,24 +1,52 @@
 import json
+import os
 import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 
+# Browser-like headers to avoid bot detection
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (compatible; WebsiteScraper/1.0; +https://example.com/bot)"
-    )
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
 }
+
+# Alternative headers for retry (Googlebot-like)
+HEADERS_ALT = {
+    "User-Agent": (
+        "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 TIMEOUT = 15
 MAX_PAGES = 15
 
-# Zero-width and invisible unicode characters
-_INVISIBLE_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]")
-# Collapse whitespace (spaces, tabs, non-breaking spaces)
+# Zero-width and invisible unicode characters — replaced with SPACE (not empty)
+_INVISIBLE_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff\u200e\u200f\u00ad]")
+# Collapse whitespace
 _WHITESPACE_RE = re.compile(r"[ \t\u00a0]+")
 
-# Common CTA / boilerplate phrases to strip
+# Boilerplate phrases (line-level removal if line < 80 chars)
 _BOILERPLATE_PHRASES = [
     "get started", "learn more", "read more", "sign up", "start free trial",
     "book a demo", "request a demo", "schedule a demo", "try for free",
@@ -26,34 +54,77 @@ _BOILERPLATE_PHRASES = [
     "start now", "join now", "subscribe now", "download now",
     "accept all cookies", "cookie policy", "we use cookies",
     "accept cookies", "manage cookies", "cookie settings",
+    "skip to main content", "skip to footer", "skip to navigation",
+    "skip to content", "toggle navigation", "close menu", "open menu",
+    "register now", "sign in", "log in", "create account",
 ]
+
+# Short standalone CTA phrases to strip even inline (exact match boundaries)
+_INLINE_CTA_RE = re.compile(
+    r"\b(?:Get Started|Learn More|Read More|Sign Up|Book a Demo|Request a Demo|"
+    r"Register Now|Start Free Trial|Try for Free|Contact Sales|Talk to Sales|"
+    r"Watch Demo|See it in Action|Download Now|Subscribe Now|Start Now|"
+    r"Join Now|Skip to main content|Skip to footer|Skip to navigation|"
+    r"Skip to content)\b",
+    re.IGNORECASE,
+)
+
+
+def _build_session() -> requests.Session:
+    """Build a requests session with retry logic."""
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "HEAD"],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
 
 def _clean_text(text: str) -> str:
-    """Remove invisible chars and collapse whitespace."""
-    text = _INVISIBLE_RE.sub("", text)
+    """Remove invisible chars (replaced with space), collapse whitespace, strip JS artifacts."""
+    # Replace invisible chars with space (prevents word merging)
+    text = _INVISIBLE_RE.sub(" ", text)
+    # Collapse whitespace
     text = _WHITESPACE_RE.sub(" ", text)
+    # Collapse blank lines
     text = re.sub(r"\n[ \t]*\n+", "\n", text)
+    # Strip JS placeholder artifacts
+    text = re.sub(r"\bundefined\b", "", text)
+    text = re.sub(r"\bnull\b(?!\s+(?:and|or|pointer|value|check|safety))", "", text)
     return text.strip()
 
 
 def _remove_boilerplate(text: str) -> str:
-    """Remove common CTA and cookie-banner sentences."""
+    """Remove CTA, cookie-banner, and navigation boilerplate."""
+    # Line-level removal
     lines = text.split("\n")
     cleaned = []
     for line in lines:
         lower = line.lower().strip()
-        if any(bp in lower for bp in _BOILERPLATE_PHRASES) and len(lower) < 80:
+        if not lower:
+            continue
+        if any(bp == lower or (bp in lower and len(lower) < 80) for bp in _BOILERPLATE_PHRASES):
             continue
         cleaned.append(line)
-    return "\n".join(cleaned)
+    text = "\n".join(cleaned)
+
+    # Inline CTA removal
+    text = _INLINE_CTA_RE.sub("", text)
+    # Clean up resulting double spaces
+    text = _WHITESPACE_RE.sub(" ", text)
+
+    return text.strip()
 
 
 def _extract_structured_data(soup: BeautifulSoup) -> dict:
     """Extract JSON-LD schema.org and OpenGraph metadata."""
     structured = {}
 
-    # JSON-LD
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "")
@@ -69,7 +140,6 @@ def _extract_structured_data(soup: BeautifulSoup) -> dict:
         except (json.JSONDecodeError, TypeError, IndexError):
             continue
 
-    # OpenGraph
     og_desc = soup.find("meta", property="og:description")
     if og_desc and og_desc.get("content"):
         structured["og_description"] = _clean_text(og_desc["content"])
@@ -118,12 +188,27 @@ def _extract_nav_links(soup: BeautifulSoup, base_url: str) -> list[str]:
     return links
 
 
-def _scrape_page(url: str) -> dict | None:
-    """Scrape a single page and return structured content."""
+def _fetch_page(session: requests.Session, url: str, headers: dict) -> requests.Response | None:
+    """Fetch a page with given session and headers."""
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        resp = session.get(url, headers=headers, timeout=TIMEOUT, allow_redirects=True)
         resp.raise_for_status()
+        # Skip non-HTML responses
+        content_type = resp.headers.get("content-type", "")
+        if "text/html" not in content_type and "application/xhtml" not in content_type:
+            return None
+        return resp
     except requests.RequestException:
+        return None
+
+
+def _scrape_page(session: requests.Session, url: str) -> dict | None:
+    """Scrape a single page and return structured content."""
+    # Try primary headers first, then alt headers
+    resp = _fetch_page(session, url, HEADERS)
+    if resp is None:
+        resp = _fetch_page(session, url, HEADERS_ALT)
+    if resp is None:
         return None
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -148,8 +233,17 @@ def _scrape_page(url: str) -> dict | None:
     ]
 
     # Decompose noisy elements before extracting body text
-    for tag in soup.find_all(["script", "style", "nav", "footer", "aside"]):
+    for tag in soup.find_all(["script", "style", "nav", "footer", "aside", "header", "noscript"]):
         tag.decompose()
+    # Decompose by role/class patterns
+    for selector in [
+        "[role='navigation']", "[role='banner']", "[role='contentinfo']",
+        "[class*='cookie']", "[id*='cookie']",
+        "[class*='banner']", "[class*='popup']", "[class*='modal']",
+        "[class*='mega-menu']", "[class*='nav-']", "[class*='dropdown-menu']",
+    ]:
+        for tag in soup.select(selector):
+            tag.decompose()
 
     # Main text: prefer <main>, then <article>, then <body>
     main = soup.find("main") or soup.find("article") or soup.body
@@ -169,21 +263,20 @@ def _scrape_page(url: str) -> dict | None:
     }
 
 
-def scrape_site(url: str) -> dict:
-    """Scrape a website's main pages starting from the given URL."""
-    url = url.strip()
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-
+def _scrape_site_requests(url: str) -> dict:
+    """Primary scraper using requests with retry logic."""
     parsed = urlparse(url)
     base_url = f"{parsed.scheme}://{parsed.netloc}"
     domain = parsed.netloc
 
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Cannot reach {url}: {exc}") from exc
+    session = _build_session()
+
+    # Fetch homepage
+    resp = _fetch_page(session, url, HEADERS)
+    if resp is None:
+        resp = _fetch_page(session, url, HEADERS_ALT)
+    if resp is None:
+        raise RuntimeError(f"Cannot reach {url}")
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -201,7 +294,7 @@ def scrape_site(url: str) -> dict:
             continue
         scraped_urls.add(normalized)
 
-        page = _scrape_page(link)
+        page = _scrape_page(session, link)
         if page:
             pages.append(page)
         if len(pages) >= MAX_PAGES:
@@ -211,3 +304,62 @@ def scrape_site(url: str) -> dict:
         "domain": domain,
         "pages": pages,
     }
+
+
+def _scrape_site_scrapy(url: str) -> dict:
+    """Fallback scraper using Scrapy via subprocess."""
+    domain = urlparse(url).netloc
+    spider_script = Path(__file__).parent / "scrapy_fallback.py"
+
+    if not spider_script.exists():
+        return {"domain": domain, "pages": []}
+
+    fd, output_path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+
+    try:
+        subprocess.run(
+            [sys.executable, str(spider_script), url, output_path],
+            capture_output=True,
+            timeout=90,
+        )
+        with open(output_path) as f:
+            result = json.load(f)
+        return result
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError, OSError):
+        return {"domain": domain, "pages": []}
+    finally:
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
+
+
+def scrape_site(url: str) -> dict:
+    """Scrape a website: try requests first, fall back to Scrapy.
+
+    Returns a dict with domain and scraped pages.
+    """
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    # Strategy 1: requests with retry
+    try:
+        result = _scrape_site_requests(url)
+        if result["pages"]:
+            return result
+    except Exception:
+        pass
+
+    # Strategy 2: Scrapy fallback (different engine, better cookie/redirect handling)
+    try:
+        result = _scrape_site_scrapy(url)
+        if result["pages"]:
+            return result
+    except Exception:
+        pass
+
+    # Both failed
+    domain = urlparse(url).netloc
+    raise RuntimeError(f"Cannot scrape {url}: all strategies failed (requests + Scrapy)")

@@ -3,14 +3,14 @@ from urllib.parse import urlparse
 # Pass 1: URL-path keywords (high confidence, exact segment matches)
 URL_RULES: list[tuple[str, list[str]]] = [
     ("pricing", ["pricing", "plans", "tarif", "price", "cost", "subscription"]),
-    ("product", ["product", "features", "solution", "use-case", "platform", "capabilities"]),
-    ("about", ["about", "team", "a-propos", "qui-sommes", "our-story", "our-team", "leadership"]),
-    ("contact", ["contact", "contact-us", "contactez"]),
+    ("product", ["product", "features", "solution", "use-case", "platform", "capabilities", "compare", "trial", "services", "solutions"]),
+    ("about", ["about", "team", "a-propos", "qui-sommes", "quem-somos", "sobre", "uber-uns", "our-story", "our-team", "leadership", "empresa", "equipe"]),
+    ("contact", ["contact", "contact-us", "contactez", "contato", "kontakt", "fale-conosco"]),
     ("blog", ["blog", "articles", "news", "actualites", "insights", "resources"]),
     ("legal", ["privacy", "terms", "legal", "cgu", "cgv", "mentions-legales", "cookie", "gdpr", "imprint", "disclaimer"]),
     ("careers", ["careers", "jobs", "recrutement", "hiring", "open-positions", "join-us", "work-with-us"]),
     ("faq", ["faq", "help", "support", "help-center", "knowledge-base"]),
-    ("partners", ["partner", "partenaire", "integrations", "marketplace", "ecosystem"]),
+    ("partners", ["partner", "partenaire", "integrations", "marketplace", "ecosystem", "partnership"]),
     ("case-study", ["case-stud", "temoignage", "success-stor", "customer-stor", "clients", "testimonial"]),
     ("press", ["press", "presse", "media", "newsroom", "in-the-news"]),
     ("investors", ["investor", "ir", "shareholders", "annual-report", "governance"]),
@@ -22,7 +22,7 @@ URL_RULES: list[tuple[str, list[str]]] = [
 CONTENT_RULES: list[tuple[str, list[str]]] = [
     ("pricing", ["pricing", "price", "cost", "subscription", "free trial", "per month", "per year", "plan"]),
     ("product", ["product", "feature", "solution", "how it works", "capabilities", "platform"]),
-    ("about", ["about us", "our team", "our story", "who we are", "our mission", "founded"]),
+    ("about", ["about us", "our team", "our story", "who we are", "our mission", "founded", "quem somos", "nossa miss"]),
     ("contact", ["contact us", "get in touch", "reach out"]),
     ("blog", ["blog", "article", "news", "latest post", "insights"]),
     ("legal", ["privacy policy", "terms of service", "terms and conditions", "cookie policy", "legal notice"]),
@@ -48,7 +48,8 @@ def categorize_page(url: str, content: dict) -> str:
     # Homepage detection
     if path in ("", "home", "index", "index.html"):
         return "home"
-    if len(path) <= 3 and path.isalpha():
+    # Localized homepages: /fr, /en, /ar, /pt-br, etc.
+    if len(path) <= 5 and all(c.isalpha() or c == "-" for c in path):
         return "home"
 
     # Pass 1: URL path keywords
